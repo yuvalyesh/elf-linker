@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.ro
+myELF
+a.out
+out.ro
+
+# IDE
+.vscode/
+.idea/
+.devcontainer/
+
+# OS
+.DS_Store
+Thumbs.db
