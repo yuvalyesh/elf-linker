@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -11,8 +12,7 @@
 /* --- Structure Declarations --- */
 typedef struct {
     char *filename;
-    int fd;
-    void *map_start;
+    char *map_start;
     off_t file_size;
     Elf32_Ehdr *ehdr;
     Elf32_Shdr *shdr_table;
@@ -20,7 +20,7 @@ typedef struct {
 
 struct fun_desc {
     char name;
-    void (*fun)();
+    void (*fun)(void);
 };
 
 /* --- Global Variables --- */
@@ -31,56 +31,141 @@ int file_count = 0;
 /* --- Helper Functions --- */
 const char* get_section_type_name(Elf32_Word sh_type) {
     switch(sh_type) {
-        case SHT_NULL:     return "NULL";
-        case SHT_PROGBITS: return "PROGBITS";
-        case SHT_SYMTAB:   return "SYMTAB";
-        case SHT_STRTAB:   return "STRTAB";
-        case SHT_RELA:     return "RELA";
-        case SHT_HASH:     return "HASH";
-        case SHT_DYNAMIC:  return "DYNAMIC";
-        case SHT_NOTE:     return "NOTE";
-        case SHT_NOBITS:   return "NOBITS";
-        case SHT_REL:      return "REL";
-        case SHT_SHLIB:    return "SHLIB";
-        case SHT_DYNSYM:   return "DYNSYM";
-        default:           return "UNKNOWN";
+        case SHT_NULL:       return "NULL";
+        case SHT_PROGBITS:   return "PROGBITS";
+        case SHT_SYMTAB:     return "SYMTAB";
+        case SHT_STRTAB:     return "STRTAB";
+        case SHT_RELA:       return "RELA";
+        case SHT_HASH:       return "HASH";
+        case SHT_DYNAMIC:    return "DYNAMIC";
+        case SHT_NOTE:       return "NOTE";
+        case SHT_NOBITS:     return "NOBITS";
+        case SHT_REL:        return "REL";
+        case SHT_SHLIB:      return "SHLIB";
+        case SHT_DYNSYM:     return "DYNSYM";
+        case SHT_INIT_ARRAY: return "INIT_ARRAY";
+        case SHT_FINI_ARRAY: return "FINI_ARRAY";
+        case SHT_GROUP:      return "GROUP";
+        case SHT_GNU_HASH:   return "GNU_HASH";
+        case SHT_GNU_versym: return "VERSYM";
+        case SHT_GNU_verneed:return "VERNEED";
+        default:             return "UNKNOWN";
     }
 }
 
 void clean_file_index(int idx) {
-    if (mapped_files[idx].map_start && mapped_files[idx].map_start != MAP_FAILED) {
+    if (mapped_files[idx].map_start) {
         munmap(mapped_files[idx].map_start, mapped_files[idx].file_size);
     }
-    if (mapped_files[idx].fd > 0) {
-        close(mapped_files[idx].fd);
-    }
-    if (mapped_files[idx].filename) {
-        free(mapped_files[idx].filename);
-    }
+    free(mapped_files[idx].filename);
     memset(&mapped_files[idx], 0, sizeof(elf_file_t));
 }
 
-Elf32_Shdr* find_section_by_name(elf_file_t *file, const char *name) {
-    if (!file || !file->ehdr || !file->shdr_table) return NULL;
-    Elf32_Shdr *shstrtab_hdr = &file->shdr_table[file->ehdr->e_shstrndx];
-    char *shstrtab = (char *)(file->map_start + shstrtab_hdr->sh_offset);
-    
+/* True if [off, off+size) lies inside the mapped file. */
+static int in_file(const elf_file_t *file, Elf32_Off off, Elf32_Word size) {
+    return (off_t)off <= file->file_size && (off_t)size <= file->file_size - (off_t)off;
+}
+
+static Elf32_Shdr *get_shdr(const elf_file_t *file, Elf32_Word idx) {
+    return idx < file->ehdr->e_shnum ? &file->shdr_table[idx] : NULL;
+}
+
+/* NUL-terminated string at `idx` inside string-table section `strtab`, or a placeholder. */
+static const char *get_str(const elf_file_t *file, const Elf32_Shdr *strtab, Elf32_Word idx) {
+    if (!strtab || strtab->sh_type != SHT_STRTAB || idx >= strtab->sh_size) return "<bad-name>";
+    const char *start = file->map_start + strtab->sh_offset + idx;
+    if (!memchr(start, '\0', strtab->sh_size - idx)) return "<bad-name>";
+    return start;
+}
+
+static const char *section_name(const elf_file_t *file, Elf32_Word idx) {
+    Elf32_Shdr *shdr = get_shdr(file, idx);
+    if (!shdr) return "<bad-index>";
+    return get_str(file, get_shdr(file, file->ehdr->e_shstrndx), shdr->sh_name);
+}
+
+/* Returns the (single) SHT_SYMTAB section, NULL if absent; *count = -1 if more than one. */
+static Elf32_Shdr *find_symtab(const elf_file_t *file, int *count) {
+    Elf32_Shdr *found = NULL;
+    *count = 0;
     for (int i = 0; i < file->ehdr->e_shnum; i++) {
-        if (strcmp(shstrtab + file->shdr_table[i].sh_name, name) == 0) {
+        if (file->shdr_table[i].sh_type == SHT_SYMTAB) {
+            found = &file->shdr_table[i];
+            (*count)++;
+        }
+    }
+    return found;
+}
+
+static Elf32_Shdr *find_section_by_name(const elf_file_t *file, const char *name) {
+    for (int i = 0; i < file->ehdr->e_shnum; i++) {
+        if (strcmp(section_name(file, i), name) == 0) {
             return &file->shdr_table[i];
         }
     }
     return NULL;
 }
 
+/*
+ * Structural validation done once at load time, so later code can index the
+ * section table and dereference section data without re-checking bounds.
+ * Returns NULL on success or a description of the problem.
+ */
+static const char *validate_elf32(elf_file_t *file) {
+    const Elf32_Ehdr *ehdr = file->ehdr;
+    if (file->file_size < (off_t)sizeof(Elf32_Ehdr)) return "file too small for an ELF header";
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return "bad ELF magic";
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) return "not an ELF32 file (compile with gcc -m32)";
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) return "only little-endian ELF is supported";
+    if (ehdr->e_shnum == 0) return "no section header table";
+    if (ehdr->e_shentsize != sizeof(Elf32_Shdr)) return "unexpected section header size";
+    if (!in_file(file, ehdr->e_shoff, (Elf32_Word)ehdr->e_shnum * sizeof(Elf32_Shdr)))
+        return "section header table lies outside the file";
+    if (ehdr->e_shoff % 4 != 0) return "misaligned section header table";
+    if (ehdr->e_shstrndx >= ehdr->e_shnum) return "invalid section-name string table index";
+    file->shdr_table = (Elf32_Shdr *)(file->map_start + ehdr->e_shoff);
+
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        const Elf32_Shdr *shdr = &file->shdr_table[i];
+        if (shdr->sh_type == SHT_NULL || shdr->sh_type == SHT_NOBITS) continue;
+        if (!in_file(file, shdr->sh_offset, shdr->sh_size)) return "section data lies outside the file";
+        if (shdr->sh_type == SHT_SYMTAB || shdr->sh_type == SHT_DYNSYM) {
+            if (shdr->sh_entsize != sizeof(Elf32_Sym) || shdr->sh_offset % 4 != 0 ||
+                shdr->sh_size % sizeof(Elf32_Sym) != 0)
+                return "malformed symbol table";
+            if (shdr->sh_link >= ehdr->e_shnum) return "symbol table links to an invalid string table";
+        }
+        if (shdr->sh_type == SHT_REL) {
+            if (shdr->sh_entsize != sizeof(Elf32_Rel) || shdr->sh_offset % 4 != 0 ||
+                shdr->sh_size % sizeof(Elf32_Rel) != 0)
+                return "malformed relocation table";
+            if (shdr->sh_link >= ehdr->e_shnum) return "relocation table links to an invalid symbol table";
+            if (file->shdr_table[shdr->sh_link].sh_type != SHT_SYMTAB &&
+                file->shdr_table[shdr->sh_link].sh_type != SHT_DYNSYM)
+                return "relocation table links to a non-symbol-table section";
+        }
+    }
+    return NULL;
+}
+
+/* Name for a symbol's st_shndx, written into `buf`. */
+static const char *symbol_section_label(const elf_file_t *file, Elf32_Half shndx, char *buf, size_t len) {
+    if (shndx == SHN_UNDEF) return "UND";
+    if (shndx == SHN_ABS) return "ABS";
+    if (shndx == SHN_COMMON) return "COM";
+    if (shndx < file->ehdr->e_shnum) return section_name(file, shndx);
+    snprintf(buf, len, "%u", (unsigned)shndx);
+    return buf;
+}
+
 /* --- Menu Actions --- */
 
-void toggle_debug_mode() {
+void toggle_debug_mode(void) {
     debug_mode = !debug_mode;
     printf("Debug mode is now %s\n", debug_mode ? "ON" : "OFF");
 }
 
-void examine_elf_file() {
+void examine_elf_file(void) {
     if (file_count >= 2) {
         printf("Error: Already handling maximum limit of 2 ELF files.\n");
         return;
@@ -102,55 +187,65 @@ void examine_elf_file() {
         close(fd);
         return;
     }
+    if (sb.st_size == 0) {
+        printf("Error: File '%s' is empty.\n", filename);
+        close(fd);
+        return;
+    }
 
-    void *map_start = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    char *map_start = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd); /* the mapping stays valid after the descriptor is closed */
     if (map_start == MAP_FAILED) {
         perror("Error mapping file");
-        close(fd);
         return;
     }
 
-    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)map_start;
+    elf_file_t candidate = {0};
+    candidate.map_start = map_start;
+    candidate.file_size = sb.st_size;
+    candidate.ehdr = (Elf32_Ehdr *)map_start;
 
-    // Validate ELF Magic Numbers
-    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 || ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-        ehdr->e_ident[EI_MAG2] != ELFMAG2 || ehdr->e_ident[EI_MAG3] != ELFMAG3) {
-        printf("Error: File '%s' is not a valid ELF file.\n", filename);
+    // Validate before trusting any offset in the file
+    const char *problem = "file too small for an ELF header";
+    if (sb.st_size >= (off_t)sizeof(Elf32_Ehdr)) {
+        problem = validate_elf32(&candidate);
+    }
+    if (problem) {
+        printf("Error: File '%s' is not a supported ELF32 file: %s.\n", filename, problem);
         munmap(map_start, sb.st_size);
-        close(fd);
         return;
     }
 
-    // Capture valid metadata into file structure
-    mapped_files[file_count].filename = strdup(filename);
-    mapped_files[file_count].fd = fd;
-    mapped_files[file_count].map_start = map_start;
-    mapped_files[file_count].file_size = sb.st_size;
-    mapped_files[file_count].ehdr = ehdr;
-    mapped_files[file_count].shdr_table = (Elf32_Shdr *)(map_start + ehdr->e_shoff);
+    candidate.filename = strdup(filename);
+    if (!candidate.filename) {
+        perror("strdup");
+        munmap(map_start, sb.st_size);
+        return;
+    }
+    mapped_files[file_count] = candidate;
+    Elf32_Ehdr *ehdr = candidate.ehdr;
 
     // Print Specifications
     printf("\nELF Header Specifications:\n");
     printf("  Magic bytes 1,2,3:         %c %c %c\n", ehdr->e_ident[1], ehdr->e_ident[2], ehdr->e_ident[3]);
-    printf("  Data encoding scheme:      %d (%s)\n", ehdr->e_ident[EI_DATA], 
-           ehdr->e_ident[EI_DATA] == ELFDATA2LSB ? "2's complement, little endian" : "Big Endian");
+    printf("  Data encoding scheme:      %d (%s)\n", ehdr->e_ident[EI_DATA], "2's complement, little endian");
     printf("  Entry point address:       0x%x\n", ehdr->e_entry);
-    printf("  Section header table off:  %d (bytes)\n", ehdr->e_shoff);
+    printf("  Section header table off:  %u (bytes)\n", ehdr->e_shoff);
     printf("  Number of section headers: %d\n", ehdr->e_shnum);
     printf("  Size of section header:    %d (bytes)\n", ehdr->e_shentsize);
-    printf("  Program header table off:  %d (bytes)\n", ehdr->e_phoff);
+    printf("  Program header table off:  %u (bytes)\n", ehdr->e_phoff);
     printf("  Number of program headers: %d\n", ehdr->e_phnum);
     printf("  Size of program header:    %d (bytes)\n", ehdr->e_phentsize);
 
     if (debug_mode) {
-        printf("[DEBUG] Mapped starting address: %p\n", map_start);
+        printf("[DEBUG] Mapped starting address: %p\n", (void *)map_start);
         printf("[DEBUG] String table index (shstrndx): %d\n", ehdr->e_shstrndx);
     }
 
     file_count++;
 }
 
-void print_section_names() {
+void print_section_names(void) {
     if (file_count == 0) {
         printf("Error: No files currently mapped.\n");
         return;
@@ -159,10 +254,9 @@ void print_section_names() {
     for (int f = 0; f < file_count; f++) {
         elf_file_t *file = &mapped_files[f];
         Elf32_Shdr *shstrtab_hdr = &file->shdr_table[file->ehdr->e_shstrndx];
-        char *shstrtab = (char *)(file->map_start + shstrtab_hdr->sh_offset);
 
         if (debug_mode) {
-            printf("[DEBUG] File %s: shstrtab section offset: %d, size: %d\n", 
+            printf("[DEBUG] File %s: shstrtab section offset: %u, size: %u\n",
                    file->filename, shstrtab_hdr->sh_offset, shstrtab_hdr->sh_size);
         }
 
@@ -170,9 +264,9 @@ void print_section_names() {
         printf("[index] section_name         section_address section_offset section_size  section_type\n");
         for (int i = 0; i < file->ehdr->e_shnum; i++) {
             Elf32_Shdr *shdr = &file->shdr_table[i];
-            printf("[%2d]    %-20s 0x%08x      0x%06x         %d        %s\n",
+            printf("[%2d]    %-20s 0x%08x      0x%06x         %u        %s\n",
                    i,
-                   shstrtab + shdr->sh_name,
+                   section_name(file, i),
                    shdr->sh_addr,
                    shdr->sh_offset,
                    shdr->sh_size,
@@ -181,7 +275,7 @@ void print_section_names() {
     }
 }
 
-void print_symbols() {
+void print_symbols(void) {
     if (file_count == 0) {
         printf("Error: No files currently mapped.\n");
         return;
@@ -197,13 +291,8 @@ void print_symbols() {
             if (shdr->sh_type == SHT_SYMTAB || shdr->sh_type == SHT_DYNSYM) {
                 symtab_found = 1;
                 Elf32_Sym *sym_table = (Elf32_Sym *)(file->map_start + shdr->sh_offset);
-                int num_symbols = shdr->sh_size / shdr->sh_entsize;
-
-                Elf32_Shdr *strtab_hdr = &file->shdr_table[shdr->sh_link];
-                char *strtab = (char *)(file->map_start + strtab_hdr->sh_offset);
-
-                Elf32_Shdr *shstrtab_hdr = &file->shdr_table[file->ehdr->e_shstrndx];
-                char *shstrtab = (char *)(file->map_start + shstrtab_hdr->sh_offset);
+                int num_symbols = shdr->sh_size / sizeof(Elf32_Sym);
+                Elf32_Shdr *strtab_hdr = get_shdr(file, shdr->sh_link);
 
                 if (debug_mode) {
                     printf("[DEBUG] Found Symbol Table Section index: %d, Elements: %d\n", i, num_symbols);
@@ -212,22 +301,12 @@ void print_symbols() {
                 printf("[index] value      section_index section_name         symbol_name\n");
                 for (int j = 0; j < num_symbols; j++) {
                     Elf32_Sym *sym = &sym_table[j];
-                    char sec_name_buf[32];
-
-                    if (sym->st_shndx == SHN_UNDEF) {
-                        strcpy(sec_name_buf, "UND");
-                    } else if (sym->st_shndx == SHN_ABS) {
-                        strcpy(sec_name_buf, "ABS");
-                    } else if (sym->st_shndx == SHN_COMMON) {
-                        strcpy(sec_name_buf, "COM");
-                    } else if (sym->st_shndx < file->ehdr->e_shnum) {
-                        strcpy(sec_name_buf, shstrtab + file->shdr_table[sym->st_shndx].sh_name);
-                    } else {
-                        sprintf(sec_name_buf, "%d", sym->st_shndx);
-                    }
+                    char shndx_buf[16];
 
                     printf("[%2d]    0x%08x %-13d %-20s %s\n",
-                           j, sym->st_value, sym->st_shndx, sec_name_buf, strtab + sym->st_name);
+                           j, sym->st_value, sym->st_shndx,
+                           symbol_section_label(file, sym->st_shndx, shndx_buf, sizeof(shndx_buf)),
+                           get_str(file, strtab_hdr, sym->st_name));
                 }
             }
         }
@@ -237,7 +316,7 @@ void print_symbols() {
     }
 }
 
-void print_relocations() {
+void print_relocations(void) {
     if (file_count == 0) {
         printf("Error: No files currently mapped.\n");
         return;
@@ -253,26 +332,35 @@ void print_relocations() {
             if (shdr->sh_type == SHT_REL) {
                 rel_found = 1;
                 Elf32_Rel *rel_table = (Elf32_Rel *)(file->map_start + shdr->sh_offset);
-                int num_rel = shdr->sh_size / shdr->sh_entsize;
+                int num_rel = shdr->sh_size / sizeof(Elf32_Rel);
 
-                // Find associated symbol table using sh_link
+                // Find associated symbol table using sh_link (validated at load time)
                 Elf32_Shdr *symtab_hdr = &file->shdr_table[shdr->sh_link];
                 Elf32_Sym *sym_table = (Elf32_Sym *)(file->map_start + symtab_hdr->sh_offset);
+                Elf32_Word sym_count = symtab_hdr->sh_size / sizeof(Elf32_Sym);
 
                 // Find string table associated with symbol table
-                Elf32_Shdr *strtab_hdr = &file->shdr_table[symtab_hdr->sh_link];
-                char *strtab = (char *)(file->map_start + strtab_hdr->sh_offset);
+                Elf32_Shdr *strtab_hdr = get_shdr(file, symtab_hdr->sh_link);
 
                 if (debug_mode) {
                     printf("[DEBUG] Relocation section: %d, entries: %d\n", i, num_rel);
                 }
 
+                printf("Relocation section '%s' applies to '%s':\n",
+                       section_name(file, i), section_name(file, shdr->sh_info));
                 printf("[index] location   related_symbol_name  type\n");
                 for (int j = 0; j < num_rel; j++) {
                     Elf32_Rel *rel = &rel_table[j];
-                    int sym_idx = ELF32_R_SYM(rel->r_info);
+                    Elf32_Word sym_idx = ELF32_R_SYM(rel->r_info);
                     int rel_type = ELF32_R_TYPE(rel->r_info);
-                    char *sym_name = strtab + sym_table[sym_idx].st_name;
+                    const char *sym_name = "<bad-symbol>";
+                    if (sym_idx < sym_count) {
+                        Elf32_Sym *sym = &sym_table[sym_idx];
+                        // Section symbols have no name of their own; show the section instead
+                        sym_name = ELF32_ST_TYPE(sym->st_info) == STT_SECTION
+                                       ? section_name(file, sym->st_shndx)
+                                       : get_str(file, strtab_hdr, sym->st_name);
+                    }
 
                     printf("[%2d]    0x%08x %-20s %d\n", j, rel->r_offset, sym_name, rel_type);
                 }
@@ -284,7 +372,70 @@ void print_relocations() {
     }
 }
 
-void check_files_for_merge() {
+/* Symbol table view of one file used by the merge-related commands. */
+typedef struct {
+    Elf32_Sym *syms;
+    int count;
+    Elf32_Shdr *strtab;
+} symtab_view_t;
+
+static int load_symtab_view(const elf_file_t *file, symtab_view_t *view) {
+    int n;
+    Elf32_Shdr *hdr = find_symtab(file, &n);
+    if (n != 1) return 0;
+    view->syms = (Elf32_Sym *)(file->map_start + hdr->sh_offset);
+    view->count = hdr->sh_size / sizeof(Elf32_Sym);
+    view->strtab = get_shdr(file, hdr->sh_link);
+    return 1;
+}
+
+/* Global/weak, named symbol that participates in cross-file resolution. */
+static int is_linkable(const Elf32_Sym *sym) {
+    int bind = ELF32_ST_BIND(sym->st_info);
+    int type = ELF32_ST_TYPE(sym->st_info);
+    return (bind == STB_GLOBAL || bind == STB_WEAK) && type != STT_SECTION && type != STT_FILE &&
+           sym->st_name != 0;
+}
+
+/* Index of a linkable symbol named `name` in `view`, or -1. */
+static int find_linkable(const elf_file_t *file, const symtab_view_t *view, const char *name) {
+    for (int j = 1; j < view->count; j++) {
+        if (is_linkable(&view->syms[j]) && strcmp(name, get_str(file, view->strtab, view->syms[j].st_name)) == 0)
+            return j;
+    }
+    return -1;
+}
+
+/* A "strong" definition: defined, not weak, not a tentative (COMMON) definition. */
+static int is_strong_definition(const Elf32_Sym *sym) {
+    return sym->st_shndx != SHN_UNDEF && sym->st_shndx != SHN_COMMON &&
+           ELF32_ST_BIND(sym->st_info) != STB_WEAK;
+}
+
+/* Report symbols of `a` that are undefined in both files or strongly defined in both. */
+static int report_conflicts(const elf_file_t *fa, const symtab_view_t *a,
+                            const elf_file_t *fb, const symtab_view_t *b, int report_multiple) {
+    int problems = 0;
+    for (int i = 1; i < a->count; i++) {
+        const Elf32_Sym *sym = &a->syms[i];
+        if (!is_linkable(sym)) continue;
+        const char *name = get_str(fa, a->strtab, sym->st_name);
+        int j = find_linkable(fb, b, name);
+
+        if (sym->st_shndx == SHN_UNDEF) {
+            if (ELF32_ST_BIND(sym->st_info) != STB_WEAK && (j < 0 || b->syms[j].st_shndx == SHN_UNDEF)) {
+                printf("Symbol %s undefined\n", name);
+                problems++;
+            }
+        } else if (report_multiple && j >= 0 && is_strong_definition(sym) && is_strong_definition(&b->syms[j])) {
+            printf("Symbol %s multiply defined\n", name);
+            problems++;
+        }
+    }
+    return problems;
+}
+
+void check_files_for_merge(void) {
     if (file_count < 2) {
         printf("Error: Two files must be opened and mapped first.\n");
         return;
@@ -292,54 +443,56 @@ void check_files_for_merge() {
 
     elf_file_t *f1 = &mapped_files[0];
     elf_file_t *f2 = &mapped_files[1];
+    symtab_view_t v1, v2;
 
-    Elf32_Shdr *symtab1_hdr = NULL, *symtab2_hdr = NULL;
-    for (int i = 0; i < f1->ehdr->e_shnum; i++) 
-        if (f1->shdr_table[i].sh_type == SHT_SYMTAB) symtab1_hdr = &f1->shdr_table[i];
-    for (int i = 0; i < f2->ehdr->e_shnum; i++) 
-        if (f2->shdr_table[i].sh_type == SHT_SYMTAB) symtab2_hdr = &f2->shdr_table[i];
-
-    if (!symtab1_hdr || !symtab2_hdr) {
+    if (!load_symtab_view(f1, &v1) || !load_symtab_view(f2, &v2)) {
         printf("Feature not supported: Each file must contain exactly one symbol table.\n");
         return;
     }
 
-    Elf32_Sym *symtab1 = (Elf32_Sym *)(f1->map_start + symtab1_hdr->sh_offset);
-    int sym1_count = symtab1_hdr->sh_size / symtab1_hdr->sh_entsize;
-    char *strtab1 = (char *)(f1->map_start + f1->shdr_table[symtab1_hdr->sh_link].sh_offset);
-
-    Elf32_Sym *symtab2 = (Elf32_Sym *)(f2->map_start + symtab2_hdr->sh_offset);
-    int sym2_count = symtab2_hdr->sh_size / symtab2_hdr->sh_entsize;
-    char *strtab2 = (char *)(f2->map_start + f2->shdr_table[symtab2_hdr->sh_link].sh_offset);
-
-    // Loop through SYMTAB1 elements (skipping dummy null symbol)
-    for (int i = 1; i < sym1_count; i++) {
-        char *name1 = strtab1 + symtab1[i].st_name;
-        if (strlen(name1) == 0) continue;
-
-        int found_in_2 = 0;
-        int idx_in_2 = -1;
-        for (int j = 1; j < sym2_count; j++) {
-            if (strcmp(name1, strtab2 + symtab2[j].st_name) == 0) {
-                found_in_2 = 1;
-                idx_in_2 = j;
-                break;
-            }
-        }
-
-        if (symtab1[i].st_shndx == SHN_UNDEF) {
-            if (!found_in_2 || symtab2[idx_in_2].st_shndx == SHN_UNDEF) {
-                printf("Symbol %s undefined\n", name1);
-            }
-        } else {
-            if (found_in_2 && symtab2[idx_in_2].st_shndx != SHN_UNDEF) {
-                printf("Symbol %s multiply defined\n", name1);
-            }
-        }
+    // Undefined symbols are checked in both directions; clashes only need one pass
+    int problems = report_conflicts(f1, &v1, f2, &v2, 1);
+    problems += report_conflicts(f2, &v2, f1, &v1, 0);
+    if (problems == 0) {
+        printf("No conflicts found: files can be merged.\n");
     }
 }
 
-void merge_elf_files() {
+/* Sections whose contents are concatenated (file 1 data, then file 2 data). */
+static int is_mergeable_name(const char *name) {
+    return strcmp(name, ".text") == 0 || strcmp(name, ".data") == 0 ||
+           strcmp(name, ".rodata") == 0 || strcmp(name, ".bss") == 0;
+}
+
+static int write_all(int fd, const void *buf, size_t len) {
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* Pad the output with zeros up to `align` (a power of two, or 0/1 for none). */
+static int pad_to(int fd, off_t *offset, Elf32_Word align) {
+    static const char zeros[16] = {0};
+    if (align <= 1) return 0;
+    off_t target = (*offset + align - 1) & ~((off_t)align - 1);
+    while (*offset < target) {
+        size_t chunk = target - *offset > (off_t)sizeof(zeros) ? sizeof(zeros) : (size_t)(target - *offset);
+        if (write_all(fd, zeros, chunk) < 0) return -1;
+        *offset += chunk;
+    }
+    return 0;
+}
+
+static Elf32_Word align_up(Elf32_Word value, Elf32_Word align) {
+    return align <= 1 ? value : (value + align - 1) & ~(align - 1);
+}
+
+void merge_elf_files(void) {
     if (file_count < 2) {
         printf("Error: Two files must be mapped before executing merge.\n");
         return;
@@ -347,123 +500,146 @@ void merge_elf_files() {
 
     elf_file_t *f1 = &mapped_files[0];
     elf_file_t *f2 = &mapped_files[1];
+    symtab_view_t v1, v2;
+
+    if (f1->ehdr->e_type != ET_REL || f2->ehdr->e_type != ET_REL) {
+        printf("Error: Both files must be relocatable objects (ET_REL, e.g. gcc -m32 -c).\n");
+        return;
+    }
+    if (!load_symtab_view(f1, &v1) || !load_symtab_view(f2, &v2)) {
+        printf("Feature not supported: Each file must contain exactly one symbol table.\n");
+        return;
+    }
+
+    int shnum = f1->ehdr->e_shnum;
+    size_t shdr_table_size = shnum * sizeof(Elf32_Shdr);
+    Elf32_Shdr *out_shdr_table = malloc(shdr_table_size);
+    Elf32_Shdr **f2_part = calloc(shnum, sizeof(*f2_part));     /* matching file-2 section */
+    Elf32_Word *f2_offset = calloc(shnum, sizeof(*f2_offset));  /* where file-2 data starts */
+    Elf32_Sym *out_symtab = malloc(v1.count * sizeof(Elf32_Sym));
+    if (!out_shdr_table || !f2_part || !f2_offset || !out_symtab) {
+        perror("malloc");
+        goto out_free;
+    }
+    memcpy(out_shdr_table, f1->shdr_table, shdr_table_size);
+    memcpy(out_symtab, v1.syms, v1.count * sizeof(Elf32_Sym));
+
+    // Pass 1: lay out merged sections (file-2 part is placed at its own alignment)
+    for (int i = 0; i < shnum; i++) {
+        const char *name = section_name(f1, i);
+        if (!is_mergeable_name(name)) continue;
+        Elf32_Shdr *other = find_section_by_name(f2, name);
+        if (!other || other->sh_type != f1->shdr_table[i].sh_type) continue;
+        f2_part[i] = other;
+        f2_offset[i] = align_up(f1->shdr_table[i].sh_size, other->sh_addralign);
+        out_shdr_table[i].sh_size = f2_offset[i] + other->sh_size;
+        if (other->sh_addralign > out_shdr_table[i].sh_addralign)
+            out_shdr_table[i].sh_addralign = other->sh_addralign;
+    }
+
+    // Resolve file-1 UND symbols that file 2 defines in a merged section (or as ABS)
+    int resolved = 0, unresolved = 0;
+    for (int j = 1; j < v1.count; j++) {
+        Elf32_Sym *sym = &out_symtab[j];
+        if (sym->st_shndx != SHN_UNDEF || !is_linkable(sym)) continue;
+        const char *name = get_str(f1, v1.strtab, sym->st_name);
+        int m = find_linkable(f2, &v2, name);
+        if (m < 0 || v2.syms[m].st_shndx == SHN_UNDEF) continue; /* undefined in both: left for ld */
+
+        const Elf32_Sym *def = &v2.syms[m];
+        int target = -1;
+        if (def->st_shndx == SHN_ABS) {
+            sym->st_shndx = SHN_ABS;
+            sym->st_value = def->st_value;
+            target = SHN_ABS;
+        } else if (def->st_shndx < f2->ehdr->e_shnum) {
+            for (int s = 0; s < shnum; s++) {
+                if (f2_part[s] == &f2->shdr_table[def->st_shndx]) {
+                    sym->st_shndx = s;
+                    sym->st_value = def->st_value + f2_offset[s];
+                    target = s;
+                    break;
+                }
+            }
+        }
+        if (target < 0) {
+            printf("Warning: %s is defined in file 2 outside .text/.data/.rodata/.bss; left undefined\n", name);
+            unresolved++;
+            continue;
+        }
+        sym->st_info = ELF32_ST_INFO(ELF32_ST_BIND(def->st_info), ELF32_ST_TYPE(def->st_info));
+        sym->st_size = def->st_size;
+        resolved++;
+    }
 
     int out_fd = open("out.ro", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out_fd < 0) {
         perror("Error creating out.ro");
-        return;
+        goto out_free;
     }
 
-    // Baseline configuration derived from File 1
+    // Pass 2: write header placeholder, section contents, then the section header table
     Elf32_Ehdr out_ehdr = *(f1->ehdr);
-    
-    // Allocate space dynamically in memory for the output Section Header table
-    int shdr_table_size = out_ehdr.e_shnum * sizeof(Elf32_Shdr);
-    Elf32_Shdr *out_shdr_table = malloc(shdr_table_size);
-    memcpy(out_shdr_table, f1->shdr_table, shdr_table_size);
-
-    // Write placeholder header to set starting file alignment
-    write(out_fd, &out_ehdr, sizeof(Elf32_Ehdr));
     off_t current_offset = sizeof(Elf32_Ehdr);
+    if (write_all(out_fd, &out_ehdr, sizeof(Elf32_Ehdr)) < 0) goto out_write_error;
 
-    Elf32_Shdr *f1_shstrtab_hdr = &f1->shdr_table[f1->ehdr->e_shstrndx];
-    char *f1_shstrtab = (char *)(f1->map_start + f1_shstrtab_hdr->sh_offset);
-
-    // Process and append sections sequentially
-    for (int i = 0; i < out_ehdr.e_shnum; i++) {
-        char *sec_name = f1_shstrtab + f1->shdr_table[i].sh_name;
-        
-        if (f1->shdr_table[i].sh_type == SHT_NULL) {
-            memset(&out_shdr_table[i], 0, sizeof(Elf32_Shdr));
+    for (int i = 0; i < shnum; i++) {
+        Elf32_Shdr *in = &f1->shdr_table[i];
+        Elf32_Shdr *out = &out_shdr_table[i];
+        if (in->sh_type == SHT_NULL) {
+            memset(out, 0, sizeof(Elf32_Shdr));
             continue;
         }
+        if (pad_to(out_fd, &current_offset, out->sh_addralign) < 0) goto out_write_error;
+        out->sh_offset = current_offset;
+        if (in->sh_type == SHT_NOBITS) continue; /* occupies no file space */
 
-        out_shdr_table[i].sh_offset = current_offset;
+        const void *data = f1->map_start + in->sh_offset;
+        if (in->sh_type == SHT_SYMTAB) data = out_symtab;
+        if (write_all(out_fd, data, in->sh_size) < 0) goto out_write_error;
+        current_offset += in->sh_size;
 
-        if (strcmp(sec_name, ".text") == 0 || strcmp(sec_name, ".data") == 0 || strcmp(sec_name, ".rodata") == 0) {
-            // Write payload data from File 1
-            write(out_fd, f1->map_start + f1->shdr_table[i].sh_offset, f1->shdr_table[i].sh_size);
-            current_offset += f1->shdr_table[i].sh_size;
-
-            // Search and append relative payload tracking data from File 2
-            Elf32_Shdr *f2_sec = find_section_by_name(f2, sec_name);
-            if (f2_sec) {
-                write(out_fd, f2->map_start + f2_sec->sh_offset, f2_sec->sh_size);
-                out_shdr_table[i].sh_size = f1->shdr_table[i].sh_size + f2_sec->sh_size;
-                current_offset += f2_sec->sh_size;
-            } else {
-                out_shdr_table[i].sh_size = f1->shdr_table[i].sh_size;
+        if (f2_part[i]) {
+            off_t part_start = out->sh_offset + f2_offset[i];
+            while (current_offset < part_start) { /* zero padding between the two parts */
+                if (write_all(out_fd, "", 1) < 0) goto out_write_error;
+                current_offset++;
             }
-        } 
-        else if (f1->shdr_table[i].sh_type == SHT_SYMTAB) {
-            /* Part 3.3 Bonus: Perform advanced symbol table analysis & modification */
-            Elf32_Shdr *symtab1_hdr = &f1->shdr_table[i];
-            int sym_count = symtab1_hdr->sh_size / symtab1_hdr->sh_entsize;
-            Elf32_Sym *out_symtab = malloc(symtab1_hdr->sh_size);
-            memcpy(out_symtab, f1->map_start + symtab1_hdr->sh_offset, symtab1_hdr->sh_size);
-
-            char *strtab1 = (char *)(f1->map_start + f1->shdr_table[symtab1_hdr->sh_link].sh_offset);
-
-            // Access File 2 Symbol Structures
-            Elf32_Shdr *symtab2_hdr = NULL;
-            for(int k=0; k<f2->ehdr->e_shnum; k++) 
-                if(f2->shdr_table[k].sh_type == SHT_SYMTAB) symtab2_hdr = &f2->shdr_table[k];
-
-            if (symtab2_hdr) {
-                Elf32_Sym *symtab2 = (Elf32_Sym *)(f2->map_start + symtab2_hdr->sh_offset);
-                int sym2_count = symtab2_hdr->sh_size / symtab2_hdr->sh_entsize;
-                char *strtab2 = (char *)(f2->map_start + f2->shdr_table[symtab2_hdr->sh_link].sh_offset);
-                char *f2_shstrtab = (char *)(f2->map_start + f2->shdr_table[f2->ehdr->e_shstrndx].sh_offset);
-
-                for (int j = 1; j < sym_count; j++) {
-                    if (out_symtab[j].st_shndx == SHN_UNDEF) {
-                        char *name1 = strtab1 + out_symtab[j].st_name;
-                        for (int m = 1; m < sym2_count; m++) {
-                            if (strcmp(name1, strtab2 + symtab2[m].st_name) == 0 && symtab2[m].st_shndx != SHN_UNDEF) {
-                                // Resolve properties
-                                out_symtab[j].st_value = symtab2[m].st_value;
-                                
-                                // Remap section tracking parameters back to File 1 architecture indices
-                                char *f2_sec_name = f2_shstrtab + f2->shdr_table[symtab2[m].st_shndx].sh_name;
-                                for (int s = 0; s < out_ehdr.e_shnum; s++) {
-                                    if (strcmp(f1_shstrtab + f1->shdr_table[s].sh_name, f2_sec_name) == 0) {
-                                        out_symtab[j].st_shndx = s;
-                                        // Update offset referencing bounds shifts
-                                        out_symtab[j].st_value += f1->shdr_table[s].sh_size;
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            write(out_fd, out_symtab, symtab1_hdr->sh_size);
-            free(out_symtab);
-            current_offset += symtab1_hdr->sh_size;
-        }
-        else {
-            // Transfer non-mergable sections safely
-            write(out_fd, f1->map_start + f1->shdr_table[i].sh_offset, f1->shdr_table[i].sh_size);
-            current_offset += f1->shdr_table[i].sh_size;
+            if (write_all(out_fd, f2->map_start + f2_part[i]->sh_offset, f2_part[i]->sh_size) < 0)
+                goto out_write_error;
+            current_offset += f2_part[i]->sh_size;
         }
     }
 
-    // Finalize Section Header positioning tables
+    if (pad_to(out_fd, &current_offset, 4) < 0) goto out_write_error;
     out_ehdr.e_shoff = current_offset;
-    write(out_fd, out_shdr_table, shdr_table_size);
+    if (write_all(out_fd, out_shdr_table, shdr_table_size) < 0) goto out_write_error;
 
     // Seek back to write structural corrections
-    lseek(out_fd, 0, SEEK_SET);
-    write(out_fd, &out_ehdr, sizeof(Elf32_Ehdr));
+    if (lseek(out_fd, 0, SEEK_SET) < 0 || write_all(out_fd, &out_ehdr, sizeof(Elf32_Ehdr)) < 0)
+        goto out_write_error;
 
-    free(out_shdr_table);
+    if (close(out_fd) < 0) {
+        perror("Error closing out.ro");
+        unlink("out.ro");
+        goto out_free;
+    }
+    printf("Partial merge written to 'out.ro' (%d symbol(s) resolved from file 2, %d left undefined).\n",
+           resolved, unresolved);
+    goto out_free;
+
+out_write_error:
+    perror("Error writing out.ro");
     close(out_fd);
-    printf("Successfully completed partial merge. Resource saved as 'out.ro'\n");
+    unlink("out.ro");
+out_free:
+    free(out_shdr_table);
+    free(f2_part);
+    free(f2_offset);
+    free(out_symtab);
 }
 
-void quit_program() {
+void quit_program(void) {
     for (int i = 0; i < 2; i++) {
         clean_file_index(i);
     }
@@ -472,7 +648,7 @@ void quit_program() {
 }
 
 /* --- Core Application Interface Execution Loop --- */
-int main(int argc, char **argv) {
+int main(void) {
     struct fun_desc menu[] = {
         {'D', toggle_debug_mode},
         {'F', examine_elf_file},
@@ -500,7 +676,7 @@ int main(int argc, char **argv) {
         char option[10];
         if (scanf("%9s", option) != 1) break;
 
-        char choice = option[0];
+        char choice = toupper((unsigned char)option[0]);
         int handled = 0;
         for (int i = 0; menu[i].name != 0; i++) {
             if (menu[i].name == choice) {
@@ -513,5 +689,6 @@ int main(int argc, char **argv) {
             printf("Unknown option sequence requested.\n");
         }
     }
+    quit_program(); /* EOF on stdin: release mappings like 'Q' does */
     return 0;
 }
